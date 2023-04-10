@@ -24,12 +24,20 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.Semaphore
 
 class MainActivity: FlutterActivity() {
     private val METHOD_CHANNEL_NAME = "com.example.raw_image_camera_app/camera2"
 
     private var methodChannel: MethodChannel? = null
     private lateinit var cameraManager: CameraManager
+
+    private val imageCaptureSemaphore = Semaphore(1)
+
+    private var cameraReady = false
+
+    private lateinit var captureResult: TotalCaptureResult
+
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -38,6 +46,8 @@ class MainActivity: FlutterActivity() {
     }
 
     override fun onDestroy() {
+        cameraDevice?.close()
+        captureSession?.close()
         teardownChannels()
         super.onDestroy()
     }
@@ -75,21 +85,76 @@ class MainActivity: FlutterActivity() {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
 
+
+    private fun saveImage(
+        image: Image?,
+        captureResult: CaptureResult,
+        characteristics: CameraCharacteristics,
+        result: MethodChannel.Result
+    ) {
+        Log.i("MainActivity", "saveImage called")
+        if (image == null) {
+            Log.e("MainActivity", "Image is null")
+            result.error("NULL_IMAGE", "Image is null", null)
+            return
+        }
+        var fos: FileOutputStream? = null
+
+        try {
+            val timeStamp = SimpleDateFormat(
+                "yyyyMMdd_HHmmss",
+                Locale.getDefault()
+            ).format(Date())
+            val imageFileName = "IMG_$timeStamp.dng"
+            val storageDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+            val imageFile = File(storageDir, imageFileName)
+
+            fos = FileOutputStream(imageFile)
+            val dngCreator = DngCreator(characteristics, captureResult)
+            if (image != null) {
+                dngCreator.writeImage(fos, image)
+            }
+
+            MediaScannerConnection.scanFile(this@MainActivity, arrayOf(imageFile.toString()), null) { _, _ ->
+                Log.i("MainActivity", "Image added to gallery: ${imageFile.absolutePath}")
+            }
+
+            result.success(imageFile.absolutePath) // Send the image path back to Flutter
+
+        } catch (e: IOException) {
+            result.error("IO_ERROR", "Failed to save image", e.message)
+        } finally {
+            image.close()
+            fos?.close()
+            imageCaptureSemaphore.release()
+        }
+    }
+
+
     private fun captureImage(cameraId: String, result: MethodChannel.Result) {
         try {
+            imageCaptureSemaphore.acquire()
+            cameraReady = true // Set cameraReady to true here
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val largestImageSize = Collections.max(
-                map?.let { listOf(*it.getOutputSizes(ImageFormat.JPEG)) },
-                CompareSizesByArea()
-            )
-            val reader = ImageReader.newInstance(
-                largestImageSize.width,
-                largestImageSize.height,
-                ImageFormat.JPEG,
-                1
-            )
-
+            val largestImageSize = map?.let { listOf(*it.getOutputSizes(ImageFormat.RAW_SENSOR)) }?.let {
+                Collections.max(
+                    it,
+                    CompareSizesByArea()
+                )
+            }
+            val reader = largestImageSize?.let {
+                ImageReader.newInstance(
+                    it.width,
+                    largestImageSize.height,
+                    ImageFormat.RAW_SENSOR,
+                    1
+                )
+            }
+            if (!cameraReady) {
+                result.error("CAMERA_NOT_READY", "Camera is not ready", null)
+                return
+            }
             if (ActivityCompat.checkSelfPermission(
                     this,
                     Manifest.permission.CAMERA
@@ -104,78 +169,63 @@ class MainActivity: FlutterActivity() {
                 // for ActivityCompat#requestPermissions for more details.
                 return
             }
+
+            reader?.setOnImageAvailableListener({ r ->
+                val image = r.acquireLatestImage()
+                // Save the image when it becomes available
+                saveImage(image, captureResult, characteristics, result)
+            }, null)
             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(@NonNull camera: CameraDevice) {
+                    Log.i("MainActivity", "Camera opened")
                     cameraDevice = camera
 
                     val captureRequestBuilder =
                         camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                    captureRequestBuilder.addTarget(reader.surface)
+                    if (reader != null) {
+                        captureRequestBuilder.addTarget(reader.surface)
+                    }
                     captureRequestBuilder.set(
                         CaptureRequest.CONTROL_MODE,
                         CameraMetadata.CONTROL_MODE_AUTO
                     )
 
-                    camera.createCaptureSession(
-                        listOf(reader.surface),
-                        object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(@NonNull session: CameraCaptureSession) {
-                                captureSession = session
-                                val captureRequest = captureRequestBuilder.build()
+                    if (reader != null) {
+                        camera.createCaptureSession(
+                            listOf(reader.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(@NonNull session: CameraCaptureSession) {
+                                    Log.i("MainActivity", "CameraCaptureSession configured")
+                                    captureSession = session
+                                    val captureRequest = captureRequestBuilder.build()
 
-                                reader.setOnImageAvailableListener({ imageReader ->
-                                    var image: Image? = null
-                                    var fos: FileOutputStream? = null
-                                    var buffer: ByteBuffer? = null
+                                    session.capture(
+                                        captureRequest,
+                                        object : CameraCaptureSession.CaptureCallback() {
+                                            override fun onCaptureCompleted(
+                                                session: CameraCaptureSession,
+                                                request: CaptureRequest,
+                                                totalCaptureResult: TotalCaptureResult
+                                            ) {
+                                                super.onCaptureCompleted(session, request, totalCaptureResult)
+                                                captureResult = totalCaptureResult
+                                            }
+                                        },
+                                        null
+                                    )
 
-                                    try {
-                                        image = imageReader.acquireNextImage()
-                                        buffer = image.planes[0].buffer
-                                        val bytes = ByteArray(buffer.remaining())
-                                        buffer.get(bytes)
-                                        val timeStamp = SimpleDateFormat(
-                                            "yyyyMMdd_HHmmss",
-                                            Locale.getDefault()
-                                        ).format(Date())
-                                        val imageFileName = "IMG_$timeStamp.jpg"
-                                        val storageDir =
-                                            getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-                                        val imageFile = File(storageDir, imageFileName)
-
-                                        fos = FileOutputStream(imageFile)
-                                        fos.write(bytes)
-
-                                        MediaScannerConnection.scanFile(this@MainActivity, arrayOf(imageFile.toString()), null) { _, _ ->
-                                            Log.i("MainActivity", "Image added to gallery: ${imageFile.absolutePath}")
-                                        }
-
-                                        result.success(imageFile.absolutePath) // Send the image path back to Flutter
-
-                                    } catch (e: IOException) {
-                                        result.error("IO_ERROR", "Failed to save image", e.message)
-                                    } finally {
-                                        image?.close()
-                                        fos?.close()
-                                    }
-                                }, null)
-
-                                session.capture(
-                                    captureRequest,
-                                    object : CameraCaptureSession.CaptureCallback() {},
-                                    null
-                                )
-                            }
-
-                            override fun onConfigureFailed(session: CameraCaptureSession) {
-                                result.error(
-                                    "CAPTURE_SESSION_ERROR",
-                                    "Failed to configure capture session",
-                                    null
-                                )
-                            }
-                        },
-                        null
-                    )
+                                }
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    result.error(
+                                        "CAPTURE_SESSION_ERROR",
+                                        "Failed to configure capture session",
+                                        null
+                                    )
+                                }
+                            },
+                            null
+                        )
+                    }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
@@ -192,9 +242,12 @@ class MainActivity: FlutterActivity() {
         } catch (e: CameraAccessException) {
             result.error("CAMERA_ACCESS_ERROR", "Failed to access camera", e.message)
         }
+        finally {
+            imageCaptureSemaphore.release()
+        }
     }
 
-    private class CompareSizesByArea : Comparator<Size> {
+    class CompareSizesByArea : Comparator<Size> {
         override fun compare(lhs: Size, rhs: Size): Int {
             return java.lang.Long.signum(lhs.width.toLong() * lhs.height - rhs.width.toLong() * rhs.height)
         }
