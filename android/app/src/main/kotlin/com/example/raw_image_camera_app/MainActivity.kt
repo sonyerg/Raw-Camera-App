@@ -137,6 +137,10 @@ class MainActivity: FlutterActivity() {
             cameraReady = true // Set cameraReady to true here
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR)
+            Log.i("MainActivity", "RAW_SENSOR supported sizes: ${Arrays.toString(rawSizes)}")
+            val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG)
+            Log.i("MainActivity", "JPEG supported sizes: ${Arrays.toString(jpegSizes)}")
             val largestImageSize = map?.let { listOf(*it.getOutputSizes(ImageFormat.RAW_SENSOR)) }?.let {
                 Collections.max(
                     it,
@@ -188,6 +192,10 @@ class MainActivity: FlutterActivity() {
                     captureRequestBuilder.set(
                         CaptureRequest.CONTROL_MODE,
                         CameraMetadata.CONTROL_MODE_AUTO
+                    )
+                    captureRequestBuilder.set(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                     )
 
                     if (reader != null) {
