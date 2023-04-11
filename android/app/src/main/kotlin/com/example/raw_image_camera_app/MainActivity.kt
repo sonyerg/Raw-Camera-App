@@ -59,14 +59,6 @@ class MainActivity: FlutterActivity() {
 
         methodChannel!!.setMethodCallHandler { call, result ->
             when (call.method) {
-                "getCameraIdList" -> {
-                    try {
-                        val cameraIdList = cameraManager.cameraIdList
-                        result.success(cameraIdList.toList())
-                    } catch (e: Exception) {
-                        result.error("CAMERA_ERROR", "Failed to get camera ID list", e.message)
-                    }
-                }
                 "captureImage" -> {
                     val cameraId = call.argument<String>("cameraId")
                     if (cameraId != null) {
@@ -265,7 +257,3 @@ class MainActivity: FlutterActivity() {
         methodChannel!!.setMethodCallHandler(null)
     }
 }
-
-
-
-
